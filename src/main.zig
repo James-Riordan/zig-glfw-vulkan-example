@@ -1,39 +1,24 @@
 const std = @import("std");
-const glfw = @import("mach-glfw");
+const glfw = @import("glfw");
 const vk = @import("vulkan");
-const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
-const Swapchain = @import("swapchain.zig").Swapchain;
+
+const GraphicsContext = @import("./graphics/graphics_context.zig").GraphicsContext;
+const Swapchain = @import("./graphics/swapchain.zig").Swapchain;
+const Vertex = @import("./graphics/vertex.zig").Vertex;
+
 const triangle_vert = @embedFile("triangle_vert");
 const triangle_frag = @embedFile("triangle_frag");
+
 const Allocator = std.mem.Allocator;
 
-const app_name = "mach-glfw + vulkan-zig = triangle";
+const VK_FALSE32: vk.Bool32 = @enumFromInt(vk.FALSE);
+const VK_TRUE32: vk.Bool32 = @enumFromInt(vk.TRUE);
 
-const Vertex = struct {
-    const binding_description = vk.VertexInputBindingDescription{
-        .binding = 0,
-        .stride = @sizeOf(Vertex),
-        .input_rate = .vertex,
-    };
+// Human-readable app name for Vulkan, logs, etc. (does NOT need NUL).
+const app_name = "glfw-zig + vulkan-zig = triangle";
 
-    const attribute_description = [_]vk.VertexInputAttributeDescription{
-        .{
-            .binding = 0,
-            .location = 0,
-            .format = .r32g32_sfloat,
-            .offset = @offsetOf(Vertex, "pos"),
-        },
-        .{
-            .binding = 0,
-            .location = 1,
-            .format = .r32g32b32_sfloat,
-            .offset = @offsetOf(Vertex, "color"),
-        },
-    };
-
-    pos: [2]f32,
-    color: [3]f32,
-};
+// NUL-terminated window title for GLFW.
+const window_title: [:0]const u8 = "glfw-zig + vulkan-zig = triangle";
 
 const vertices = [_]Vertex{
     .{ .pos = .{ 0, -0.5 }, .color = .{ 1, 0, 0 } },
@@ -41,35 +26,78 @@ const vertices = [_]Vertex{
     .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
 };
 
-/// Default GLFW error handling callback
-fn errorCallback(error_code: glfw.ErrorCode, description: [:0]const u8) void {
-    std.log.err("glfw: {}: {s}\n", .{ error_code, description });
+/// GLFW error callback: logs code + description.
+fn errorCallback(code: c_int, description: [*c]const u8) callconv(.c) void {
+    const msg: [:0]const u8 = if (description) |ptr|
+        std.mem.span(ptr)
+    else
+        "no description";
+
+    const err_code = glfw.errorCodeFromC(code);
+    std.log.err("GLFW error {any}: {s}", .{ err_code, msg });
 }
 
 pub fn main() !void {
-    glfw.setErrorCallback(errorCallback);
-    if (!glfw.init(.{})) {
-        std.log.err("failed to initialize GLFW: {?s}", .{glfw.getErrorString()});
-        std.process.exit(1);
-    }
+    // Install error callback first, so even init() failures are logged.
+    _ = glfw.setErrorCallback(errorCallback);
+
+    // Initialize GLFW
+    glfw.init() catch {
+        if (glfw.getLastError()) |err_info| {
+            const code_opt = glfw.errorCodeFromC(err_info.code);
+            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
+            const desc_str: []const u8 = err_info.description orelse "no description";
+
+            std.log.err(
+                "failed to initialize GLFW: {s}: {s}",
+                .{ code_str, desc_str },
+            );
+        } else {
+            std.log.err("failed to initialize GLFW (no error info)", .{});
+        }
+        return error.GlfwInitFailed;
+    };
     defer glfw.terminate();
 
-    var extent = vk.Extent2D{ .width = 800, .height = 600 };
-
-    const window = glfw.Window.create(extent.width, extent.height, app_name, null, null, .{
-        .client_api = .no_api,
-    }) orelse {
-        std.log.err("failed to create GLFW window: {?s}", .{glfw.getErrorString()});
-        std.process.exit(1);
+    var extent = vk.Extent2D{
+        .width = 800,
+        .height = 600,
     };
-    defer window.destroy();
+
+    // ── Vulkan window setup: no client API (no OpenGL), Vulkan-only.
+    glfw.defaultWindowHints();
+    glfw.windowHint(glfw.c.GLFW_CLIENT_API, glfw.c.GLFW_NO_API);
+
+    // Create window with no client API (Vulkan-only).
+    const window = glfw.createWindow(
+        @as(i32, @intCast(extent.width)),
+        @as(i32, @intCast(extent.height)),
+        window_title,
+        null,
+        null,
+    ) catch {
+        if (glfw.getLastError()) |err_info| {
+            const code_opt = glfw.errorCodeFromC(err_info.code);
+            const code_str = if (code_opt) |ce| @tagName(ce) else "UnknownError";
+            const desc_str: []const u8 = err_info.description orelse "no description";
+
+            std.log.err(
+                "failed to create GLFW window: {s}: {s}",
+                .{ code_str, desc_str },
+            );
+        } else {
+            std.log.err("failed to create GLFW window (no error info)", .{});
+        }
+        return error.CreateWindowFailed;
+    };
+    defer glfw.destroyWindow(window);
 
     const allocator = std.heap.page_allocator;
 
     const gc = try GraphicsContext.init(allocator, app_name, window);
     defer gc.deinit();
 
-    std.debug.print("Using device: {?s}\n", .{gc.props.device_name});
+    std.debug.print("Using device: {s}\n", .{gc.deviceName()});
 
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
@@ -101,12 +129,16 @@ pub fn main() !void {
     const buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
         .size = @sizeOf(@TypeOf(vertices)),
-        .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .usage = .{
+            .transfer_dst_bit = true,
+            .vertex_buffer_bit = true,
+        },
         .sharing_mode = .exclusive,
         .queue_family_index_count = 0,
         .p_queue_family_indices = undefined,
     }, null);
     defer gc.vkd.destroyBuffer(gc.dev, buffer, null);
+
     const mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, buffer);
     const memory = try gc.allocate(mem_reqs, .{ .device_local_bit = true });
     defer gc.vkd.freeMemory(gc.dev, memory, null);
@@ -126,7 +158,10 @@ pub fn main() !void {
     );
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
-    while (!window.shouldClose()) {
+    // ─────────────────────────────────────────────────────────────────────
+    // Main loop
+    // ─────────────────────────────────────────────────────────────────────
+    while (!glfw.windowShouldClose(window)) {
         const cmdbuf = cmdbufs[swapchain.image_index];
 
         const state = swapchain.present(cmdbuf) catch |err| switch (err) {
@@ -135,7 +170,7 @@ pub fn main() !void {
         };
 
         if (state == .suboptimal) {
-            const size = window.getSize();
+            const size = glfw.getWindowSize(window);
             extent.width = @intCast(size.width);
             extent.height = @intCast(size.height);
             try swapchain.recreate(extent);
@@ -162,6 +197,10 @@ pub fn main() !void {
     try swapchain.waitForAllFences();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload vertices
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
     const staging_buffer = try gc.vkd.createBuffer(gc.dev, &.{
         .flags = .{},
@@ -172,8 +211,12 @@ fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.B
         .p_queue_family_indices = undefined,
     }, null);
     defer gc.vkd.destroyBuffer(gc.dev, staging_buffer, null);
+
     const mem_reqs = gc.vkd.getBufferMemoryRequirements(gc.dev, staging_buffer);
-    const staging_memory = try gc.allocate(mem_reqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    const staging_memory = try gc.allocate(mem_reqs, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
     defer gc.vkd.freeMemory(gc.dev, staging_memory, null);
     try gc.vkd.bindBufferMemory(gc.dev, staging_buffer, staging_memory, 0);
 
@@ -190,7 +233,13 @@ fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.B
     try copyBuffer(gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
 }
 
-fn copyBuffer(gc: *const GraphicsContext, pool: vk.CommandPool, dst: vk.Buffer, src: vk.Buffer, size: vk.DeviceSize) !void {
+fn copyBuffer(
+    gc: *const GraphicsContext,
+    pool: vk.CommandPool,
+    dst: vk.Buffer,
+    src: vk.Buffer,
+    size: vk.DeviceSize,
+) !void {
     var cmdbuf: vk.CommandBuffer = undefined;
     try gc.vkd.allocateCommandBuffers(gc.dev, &.{
         .command_pool = pool,
@@ -222,9 +271,14 @@ fn copyBuffer(gc: *const GraphicsContext, pool: vk.CommandPool, dst: vk.Buffer, 
         .signal_semaphore_count = 0,
         .p_signal_semaphores = undefined,
     };
+
     try gc.vkd.queueSubmit(gc.graphics_queue.handle, 1, @ptrCast(&si), .null_handle);
     try gc.vkd.queueWaitIdle(gc.graphics_queue.handle);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command buffers
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn createCommandBuffers(
     gc: *const GraphicsContext,
@@ -270,10 +324,19 @@ fn createCommandBuffers(
             .p_inheritance_info = null,
         });
 
-        gc.vkd.cmdSetViewport(cmdbuf, 0, 1, @as([*]const vk.Viewport, @ptrCast(&viewport)));
-        gc.vkd.cmdSetScissor(cmdbuf, 0, 1, @as([*]const vk.Rect2D, @ptrCast(&scissor)));
+        gc.vkd.cmdSetViewport(
+            cmdbuf,
+            0,
+            1,
+            @as([*]const vk.Viewport, @ptrCast(&viewport)),
+        );
+        gc.vkd.cmdSetScissor(
+            cmdbuf,
+            0,
+            1,
+            @as([*]const vk.Rect2D, @ptrCast(&scissor)),
+        );
 
-        // This needs to be a separate definition - see https://github.com/ziglang/zig/issues/7627.
         const render_area = vk.Rect2D{
             .offset = .{ .x = 0, .y = 0 },
             .extent = extent,
@@ -288,8 +351,16 @@ fn createCommandBuffers(
         }, .@"inline");
 
         gc.vkd.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+
         const offset = [_]vk.DeviceSize{0};
-        gc.vkd.cmdBindVertexBuffers(cmdbuf, 0, 1, @as([*]const vk.Buffer, @ptrCast(&buffer)), &offset);
+        gc.vkd.cmdBindVertexBuffers(
+            cmdbuf,
+            0,
+            1,
+            @as([*]const vk.Buffer, @ptrCast(&buffer)),
+            &offset,
+        );
+
         gc.vkd.cmdDraw(cmdbuf, vertices.len, 1, 0, 0);
 
         gc.vkd.cmdEndRenderPass(cmdbuf);
@@ -299,17 +370,33 @@ fn createCommandBuffers(
     return cmdbufs;
 }
 
-fn destroyCommandBuffers(gc: *const GraphicsContext, pool: vk.CommandPool, allocator: Allocator, cmdbufs: []vk.CommandBuffer) void {
+fn destroyCommandBuffers(
+    gc: *const GraphicsContext,
+    pool: vk.CommandPool,
+    allocator: Allocator,
+    cmdbufs: []vk.CommandBuffer,
+) void {
     gc.vkd.freeCommandBuffers(gc.dev, pool, @truncate(cmdbufs.len), cmdbufs.ptr);
     allocator.free(cmdbufs);
 }
 
-fn createFramebuffers(gc: *const GraphicsContext, allocator: Allocator, render_pass: vk.RenderPass, swapchain: Swapchain) ![]vk.Framebuffer {
+// ─────────────────────────────────────────────────────────────────────────────
+// Framebuffers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn createFramebuffers(
+    gc: *const GraphicsContext,
+    allocator: Allocator,
+    render_pass: vk.RenderPass,
+    swapchain: Swapchain,
+) ![]vk.Framebuffer {
     const framebuffers = try allocator.alloc(vk.Framebuffer, swapchain.swap_images.len);
     errdefer allocator.free(framebuffers);
 
     var i: usize = 0;
-    errdefer for (framebuffers[0..i]) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
+    errdefer for (framebuffers[0..i]) |fb| {
+        gc.vkd.destroyFramebuffer(gc.dev, fb, null);
+    };
 
     for (framebuffers) |*fb| {
         fb.* = try gc.vkd.createFramebuffer(gc.dev, &vk.FramebufferCreateInfo{
@@ -327,10 +414,20 @@ fn createFramebuffers(gc: *const GraphicsContext, allocator: Allocator, render_p
     return framebuffers;
 }
 
-fn destroyFramebuffers(gc: *const GraphicsContext, allocator: Allocator, framebuffers: []const vk.Framebuffer) void {
-    for (framebuffers) |fb| gc.vkd.destroyFramebuffer(gc.dev, fb, null);
+fn destroyFramebuffers(
+    gc: *const GraphicsContext,
+    allocator: Allocator,
+    framebuffers: []const vk.Framebuffer,
+) void {
+    for (framebuffers) |fb| {
+        gc.vkd.destroyFramebuffer(gc.dev, fb, null);
+    }
     allocator.free(framebuffers);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render pass / pipeline
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn createRenderPass(gc: *const GraphicsContext, swapchain: Swapchain) !vk.RenderPass {
     const color_attachment = vk.AttachmentDescription{
@@ -413,7 +510,10 @@ fn createPipeline(
     const pvisci = vk.PipelineVertexInputStateCreateInfo{
         .flags = .{},
         .vertex_binding_description_count = 1,
-        .p_vertex_binding_descriptions = @as([*]const vk.VertexInputBindingDescription, @ptrCast(&Vertex.binding_description)),
+        .p_vertex_binding_descriptions = @as(
+            [*]const vk.VertexInputBindingDescription,
+            @ptrCast(&Vertex.binding_description),
+        ),
         .vertex_attribute_description_count = Vertex.attribute_description.len,
         .p_vertex_attribute_descriptions = &Vertex.attribute_description,
     };
@@ -421,25 +521,25 @@ fn createPipeline(
     const piasci = vk.PipelineInputAssemblyStateCreateInfo{
         .flags = .{},
         .topology = .triangle_list,
-        .primitive_restart_enable = vk.FALSE,
+        .primitive_restart_enable = VK_FALSE32,
     };
 
     const pvsci = vk.PipelineViewportStateCreateInfo{
         .flags = .{},
         .viewport_count = 1,
-        .p_viewports = undefined, // set in createCommandBuffers with cmdSetViewport
+        .p_viewports = undefined,
         .scissor_count = 1,
-        .p_scissors = undefined, // set in createCommandBuffers with cmdSetScissor
+        .p_scissors = undefined,
     };
 
     const prsci = vk.PipelineRasterizationStateCreateInfo{
         .flags = .{},
-        .depth_clamp_enable = vk.FALSE,
-        .rasterizer_discard_enable = vk.FALSE,
+        .depth_clamp_enable = VK_FALSE32,
+        .rasterizer_discard_enable = VK_FALSE32,
         .polygon_mode = .fill,
         .cull_mode = .{ .back_bit = true },
         .front_face = .clockwise,
-        .depth_bias_enable = vk.FALSE,
+        .depth_bias_enable = VK_FALSE32,
         .depth_bias_constant_factor = 0,
         .depth_bias_clamp = 0,
         .depth_bias_slope_factor = 0,
@@ -449,30 +549,38 @@ fn createPipeline(
     const pmsci = vk.PipelineMultisampleStateCreateInfo{
         .flags = .{},
         .rasterization_samples = .{ .@"1_bit" = true },
-        .sample_shading_enable = vk.FALSE,
+        .sample_shading_enable = VK_FALSE32,
         .min_sample_shading = 1,
         .p_sample_mask = null,
-        .alpha_to_coverage_enable = vk.FALSE,
-        .alpha_to_one_enable = vk.FALSE,
+        .alpha_to_coverage_enable = VK_FALSE32,
+        .alpha_to_one_enable = VK_FALSE32,
     };
 
     const pcbas = vk.PipelineColorBlendAttachmentState{
-        .blend_enable = vk.FALSE,
+        .blend_enable = VK_FALSE32,
         .src_color_blend_factor = .one,
         .dst_color_blend_factor = .zero,
         .color_blend_op = .add,
         .src_alpha_blend_factor = .one,
         .dst_alpha_blend_factor = .zero,
         .alpha_blend_op = .add,
-        .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
+        .color_write_mask = .{
+            .r_bit = true,
+            .g_bit = true,
+            .b_bit = true,
+            .a_bit = true,
+        },
     };
 
     const pcbsci = vk.PipelineColorBlendStateCreateInfo{
         .flags = .{},
-        .logic_op_enable = vk.FALSE,
+        .logic_op_enable = VK_FALSE32,
         .logic_op = .copy,
         .attachment_count = 1,
-        .p_attachments = @as([*]const vk.PipelineColorBlendAttachmentState, @ptrCast(&pcbas)),
+        .p_attachments = @as(
+            [*]const vk.PipelineColorBlendAttachmentState,
+            @ptrCast(&pcbas),
+        ),
         .blend_constants = [_]f32{ 0, 0, 0, 0 },
     };
 

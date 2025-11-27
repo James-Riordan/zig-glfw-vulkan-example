@@ -10,3 +10,6 @@
 .zig-cache/
 zig-out/
 registry/vk.xml
+
+zig-glfw-vulkan-example-advanced-project_dump.txt
+project_dump.txt

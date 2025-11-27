@@ -61,7 +61,8 @@ pub const Swapchain = struct {
             .pre_transform = caps.current_transform,
             .composite_alpha = .{ .opaque_bit_khr = true },
             .present_mode = present_mode,
-            .clipped = vk.TRUE,
+            .clipped = @as(vk.Bool32, @enumFromInt(vk.TRUE)),
+
             .old_swapchain = old_handle,
         }, null);
         errdefer gc.vkd.destroySwapchainKHR(gc.dev, handle, null);
@@ -242,7 +243,14 @@ const SwapImage = struct {
     }
 
     fn waitForFence(self: SwapImage, gc: *const GraphicsContext) !void {
-        _ = try gc.vkd.waitForFences(gc.dev, 1, @ptrCast(&self.frame_fence), vk.TRUE, std.math.maxInt(u64));
+        const wait_all: vk.Bool32 = @enumFromInt(vk.TRUE);
+        _ = try gc.vkd.waitForFences(
+            gc.dev,
+            1,
+            @ptrCast(&self.frame_fence),
+            wait_all,
+            std.math.maxInt(u64),
+        );
     }
 };
 

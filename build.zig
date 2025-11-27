@@ -1,87 +1,134 @@
 const std = @import("std");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+fn linkVulkanLoader(
+    exe: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+    b: *std.Build,
+) void {
+    const os_tag = target.result.os.tag;
 
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
+    switch (os_tag) {
+        .windows => {
+            // Try to locate the Vulkan SDK and add its Lib directory.
+            // This assumes a layout like: %VULKAN_SDK%\Lib\vulkan-1.lib
+            const sdk = std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch null;
+            if (sdk) |sdk_path| {
+                // Join "<sdk_path>" + "Lib" into a single path string.
+                const lib_dir = std.fs.path.join(b.allocator, &.{ sdk_path, "Lib" }) catch null;
+                if (lib_dir) |ld| {
+                    // LazyPath no longer has an 'absolute' variant; cwd_relative
+                    // is used for arbitrary paths (absolute or relative).
+                    exe.addLibraryPath(.{ .cwd_relative = ld });
+                }
+            }
+
+            // Windows loader name.
+            exe.linkSystemLibrary("vulkan-1");
+        },
+        .linux => {
+            // Linux loader name.
+            exe.linkSystemLibrary("vulkan");
+        },
+        .macos => {
+            // On macOS this typically comes from MoltenVK (libvulkan.dylib).
+            exe.linkSystemLibrary("vulkan");
+        },
+        else => {
+            // Other OSes: do nothing for now. The build will fail if a loader
+            // is required but missing, which is fine.
+        },
+    }
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "mach-glfw-vulkan-example",
+    // ─────────────────────────────────────────────────────────────────────
+    // Dependencies
+    // ─────────────────────────────────────────────────────────────────────
+
+    // glfw-zig (your repo), as declared in build.zig.zon under .glfw_zig.
+    // Exposes:
+    //   - module "glfw"
+    //   - artifact "glfw-zig" (which already links the GLFW C library)
+    const glfw_dep = b.dependency("glfw_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const glfw_mod = glfw_dep.module("glfw");
+    const glfw_lib = glfw_dep.artifact("glfw-zig");
+
+    // vulkan-zig (Snektron), as declared in build.zig.zon under .vulkan.
+    // We point it at our local registry/vk.xml, same as your original project.
+    const vk_dep = b.dependency("vulkan", .{
+        .registry = b.pathFromRoot("registry/vk.xml"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const vk_mod = vk_dep.module("vulkan-zig");
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Root module for the example
+    // ─────────────────────────────────────────────────────────────────────
+
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("glfw", glfw_mod);
+    exe_mod.addImport("vulkan", vk_mod);
 
-    // Use mach-glfw.
-    const mach_glfw_dep = b.dependency("mach-glfw", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("mach-glfw", mach_glfw_dep.module("mach-glfw"));
+    // ─────────────────────────────────────────────────────────────────────
+    // Shader compilation (glslc → SPIR-V → @embedFile)
+    // ─────────────────────────────────────────────────────────────────────
 
-    // Use pre-generated Vulkan bindings.
-    // const vulkan_dep = b.dependency("vulkan-zig-generated", .{});
-    // exe.root_module.addImport("vulkan", vulkan_dep.module("vulkan-zig-generated"));
-
-    const vkzig_dep = b.dependency("vulkan_zig", .{
-        .registry = @as([]const u8, b.pathFromRoot("registry/vk.xml")),
-    });
-    const vkzig_bindings = vkzig_dep.module("vulkan-zig");
-    exe.root_module.addImport("vulkan", vkzig_bindings);
-
-    // Compile the vertex shader at build time so that it can be imported with '@embedFile'.
+    // Vertex shader → triangle_vert.spv → anonymous import "triangle_vert".
     const compile_vert_shader = b.addSystemCommand(&.{"glslc"});
     compile_vert_shader.addFileArg(b.path("shaders/triangle.vert"));
     compile_vert_shader.addArgs(&.{ "--target-env=vulkan1.1", "-o" });
     const triangle_vert_spv = compile_vert_shader.addOutputFileArg("triangle_vert.spv");
-    exe.root_module.addAnonymousImport("triangle_vert", .{
+    exe_mod.addAnonymousImport("triangle_vert", .{
         .root_source_file = triangle_vert_spv,
     });
 
-    // Ditto for the fragment shader.
+    // Fragment shader → triangle_frag.spv → anonymous import "triangle_frag".
     const compile_frag_shader = b.addSystemCommand(&.{"glslc"});
     compile_frag_shader.addFileArg(b.path("shaders/triangle.frag"));
     compile_frag_shader.addArgs(&.{ "--target-env=vulkan1.1", "-o" });
     const triangle_frag_spv = compile_frag_shader.addOutputFileArg("triangle_frag.spv");
-    exe.root_module.addAnonymousImport("triangle_frag", .{
+    exe_mod.addAnonymousImport("triangle_frag", .{
         .root_source_file = triangle_frag_spv,
     });
 
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
+    // ─────────────────────────────────────────────────────────────────────
+    // Executable + run step
+    // ─────────────────────────────────────────────────────────────────────
+
+    const exe = b.addExecutable(.{
+        .name = "zig-glfw-vulkan-openxr",
+        .root_module = exe_mod,
+    });
+
+    // Pull in glfw-zig (which brings GLFW C and platform libs along).
+    exe.linkLibrary(glfw_lib);
+
+    // Pull in the Vulkan loader for the host OS.
+    linkVulkanLoader(exe, target, b);
+
+    // Install the exe as the default artifact.
     b.installArtifact(exe);
 
-    // This *creates* a Run step in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
+    // `zig build run` convenience.
     const run_cmd = b.addRunArtifact(exe);
-
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
+    // Match your old behavior: run from the install dir.
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build run`
-    // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app");
+    const run_step = b.step("run", "Run the Vulkan triangle demo");
     run_step.dependOn(&run_cmd.step);
 }
